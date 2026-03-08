@@ -2,7 +2,7 @@
 
 Claude Code plugin marketplace index for [engram](https://github.com/thebtf/engram).
 
-This is a lightweight index repository. The plugin source code lives in the main engram repo at [`plugin/`](https://github.com/thebtf/engram/tree/main/plugin) and is fetched via sparse checkout during installation.
+Plugin files are synced from the main engram repo's [`plugin/`](https://github.com/thebtf/engram/tree/main/plugin) directory. This repo exists to keep marketplace installs lightweight (~100 KB vs ~400 MB full repo clone).
 
 ## Install
 

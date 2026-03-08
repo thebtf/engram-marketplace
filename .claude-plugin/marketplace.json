@@ -14,12 +14,7 @@
       "author": {
         "name": "thebtf"
       },
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/thebtf/engram.git",
-        "path": "plugin",
-        "ref": "main"
-      },
+      "source": "./",
       "category": "productivity"
     }
   ]
