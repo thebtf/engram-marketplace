@@ -7,6 +7,13 @@ function asString(value) {
   return typeof value === 'string' ? value : '';
 }
 
+function escapeXmlTags(value) {
+  return asString(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 async function handleUserPrompt(ctx, input) {
   const prompt = asString(input.prompt) || asString(input.Prompt);
   const project = typeof ctx.Project === 'string' ? ctx.Project : '';
@@ -14,6 +21,7 @@ async function handleUserPrompt(ctx, input) {
 
   let contextToInject = '';
   let observationCount = 0;
+  let matchedCount = 0;
   const searchIds = [];
 
   try {
@@ -27,50 +35,174 @@ async function handleUserPrompt(ctx, input) {
       ? searchResult.observations
       : [];
 
-    // Collect injected observation IDs for per-session tracking (called after sessionID is known)
-    for (const obs of observations) {
-      if (obs && typeof obs === 'object' && typeof obs.id === 'number' && obs.id > 0) {
-        searchIds.push(obs.id);
-      }
-    }
+    // Filter out credentials from context injection (leak prevention).
+    // Credentials are only accessible via the dedicated get_credential MCP tool.
+    const safeObservations = observations.filter(obs => {
+      const t = asString(obs.type).toLowerCase();
+      return t !== 'credential';
+    });
 
-    if (observations.length > 0) {
-      observationCount = observations.length;
+    if (safeObservations.length > 0) {
+      // Sort by similarity score (highest first)
+      safeObservations.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+
+      // Dedup by title word overlap (>80% Jaccard = near-duplicate)
+      const dedupedObs = [];
+      for (const obs of safeObservations) {
+        const title = asString(obs.title).toLowerCase();
+        const words = new Set(title.split(/\s+/).filter(w => w.length > 2));
+        let isDup = false;
+        for (const kept of dedupedObs) {
+          const keptTitle = asString(kept.title).toLowerCase();
+          const keptWords = new Set(keptTitle.split(/\s+/).filter(w => w.length > 2));
+          if (words.size === 0 || keptWords.size === 0) continue;
+          const intersection = [...words].filter(w => keptWords.has(w)).length;
+          const union = new Set([...words, ...keptWords]).size;
+          if (union > 0 && intersection / union > 0.8) {
+            isDup = true;
+            break;
+          }
+        }
+        if (!isDup) dedupedObs.push(obs);
+      }
+
+      // Group by type
+      const groups = {
+        decisions: [],
+        patterns: [],
+        changes: [],
+        general: [],
+      };
+      for (const obs of dedupedObs) {
+        const t = asString(obs.type).toLowerCase();
+        if (t === 'decision') {
+          groups.decisions.push(obs);
+        } else if (t === 'feature' || t === 'discovery') {
+          groups.patterns.push(obs);
+        } else if (t === 'change' || t === 'refactor') {
+          groups.changes.push(obs);
+        } else {
+          groups.general.push(obs);
+        }
+      }
+
+      // Token budget: ~4 chars per token, cap at 2000 tokens
+      const TOKEN_BUDGET = 2000;
+      let tokenCount = 0;
+      const budgetObs = [];
+
+      // Process in priority order: decisions > patterns > changes > general
+      const ordered = [
+        ...groups.decisions,
+        ...groups.patterns,
+        ...groups.changes,
+        ...groups.general,
+      ];
+      for (const obs of ordered) {
+        const title = asString(obs.title);
+        const narrative = asString(obs.narrative);
+        const facts = Array.isArray(obs.facts) ? obs.facts : [];
+        let chars = title.length + narrative.length + 50;
+        for (const f of facts) {
+          if (typeof f === 'string') chars += f.length;
+        }
+        const tokens = Math.ceil(chars / 4);
+        if (tokenCount + tokens > TOKEN_BUDGET && budgetObs.length > 0) {
+          break;
+        }
+        tokenCount += tokens;
+        budgetObs.push(obs);
+      }
+
+      const trimmed = ordered.length - budgetObs.length;
+      if (trimmed > 0) {
+        console.error(`[engram] Trimmed ${trimmed} observations to fit token budget (${TOKEN_BUDGET})`);
+      }
+
+      // Collect injected observation IDs after dedup and token trimming
+      // so /mark-injected only tracks observations that actually made it into context.
+      for (const obs of budgetObs) {
+        if (obs && typeof obs === 'object' && typeof obs.id === 'number' && obs.id > 0) {
+          searchIds.push(obs.id);
+        }
+      }
+
+      // Re-group after budget trimming
+      const finalGroups = {
+        decisions: [],
+        patterns: [],
+        changes: [],
+        general: [],
+      };
+      for (const obs of budgetObs) {
+        const t = asString(obs.type).toLowerCase();
+        if (t === 'decision') {
+          finalGroups.decisions.push(obs);
+        } else if (t === 'feature' || t === 'discovery') {
+          finalGroups.patterns.push(obs);
+        } else if (t === 'change' || t === 'refactor') {
+          finalGroups.changes.push(obs);
+        } else {
+          finalGroups.general.push(obs);
+        }
+      }
+
+      // observationCount tracks injected (post-trim) count for deciding whether
+      // to return context. matchedCount is the raw search result count (pre-trim)
+      // sent to the DB so the badge shows how many memories matched the query.
+      matchedCount = safeObservations.length;
+      observationCount = budgetObs.length;
       let contextBuilder = '<relevant-memory>\n';
       contextBuilder += '# Relevant Knowledge From Previous Sessions\n';
       contextBuilder +=
         'IMPORTANT: Use this information to answer the question directly. Do NOT explore the codebase if the answer is here.\n\n';
 
-      for (let i = 0; i < observations.length; i++) {
-        const obs = observations[i];
-        if (!obs || typeof obs !== 'object') {
-          continue;
-        }
+      let idx = 1;
+      const sections = [
+        { key: 'decisions', label: 'Decisions' },
+        { key: 'patterns', label: 'Patterns & Best Practices' },
+        { key: 'changes', label: 'Recent Changes' },
+        { key: 'general', label: 'General Context' },
+      ];
 
-        const title = asString(obs.title);
-        const obsType = asString(obs.type);
-        contextBuilder += `## ${i + 1}. [${obsType}] ${title}\n`;
+      for (const section of sections) {
+        const sectionObs = finalGroups[section.key];
+        if (sectionObs.length === 0) continue;
 
-        if (Array.isArray(obs.facts) && obs.facts.length > 0) {
-          let hasFacts = false;
-          contextBuilder += 'Key facts:\n';
-          for (const fact of obs.facts) {
-            if (typeof fact === 'string' && fact !== '') {
-              hasFacts = true;
-              contextBuilder += `- ${fact}\n`;
+        contextBuilder += `### ${section.label}\n`;
+        for (const obs of sectionObs) {
+          const title = escapeXmlTags(obs.title);
+          const obsType = escapeXmlTags(asString(obs.type).toUpperCase());
+          const score = typeof obs.similarity === 'number' ? obs.similarity.toFixed(2) : '';
+          const scoreTag = score ? ` [relevance: ${score}]` : '';
+          const scopeTag = (typeof obs.scope === 'string' && obs.scope === 'global') ? ' [GLOBAL]' : '';
+
+          contextBuilder += `## ${idx}. [${obsType}] ${title}${scopeTag}${scoreTag}\n`;
+
+          if (Array.isArray(obs.facts) && obs.facts.length > 0) {
+            contextBuilder += 'Key facts:\n';
+            let hasFacts = false;
+            for (const fact of obs.facts) {
+              if (typeof fact === 'string' && fact !== '') {
+                hasFacts = true;
+                contextBuilder += `- ${escapeXmlTags(fact)}\n`;
+              }
             }
+            if (hasFacts) contextBuilder += '\n';
           }
-          if (hasFacts) {
-            contextBuilder += '\n';
-          }
-        }
 
-        const narrative = asString(obs.narrative);
-        if (narrative !== '') {
-          contextBuilder += `${narrative}\n\n`;
+          const narrative = escapeXmlTags(obs.narrative);
+          if (narrative !== '') {
+            contextBuilder += `${narrative}\n\n`;
+          }
+
+          idx++;
         }
       }
 
+      contextBuilder += '\n---\n';
+      contextBuilder += 'REMINDER: Before modifying any file mentioned above, call `find_by_file(files="path")` to check for additional context. ';
+      contextBuilder += 'Before architectural decisions, call `decisions(query="...")`. These engram MCP tools are available and MUST be used.\n';
       contextBuilder += '</relevant-memory>\n';
       contextToInject = contextBuilder;
     }
@@ -84,7 +216,7 @@ async function handleUserPrompt(ctx, input) {
       claudeSessionId: ctx.SessionID,
       project: ctx.Project,
       prompt,
-      matchedObservations: observationCount,
+      matchedObservations: matchedCount,
     });
   } catch (error) {
     console.error(`[user-prompt] Failed to initialize session: ${error.message}`);

@@ -33,17 +33,30 @@ async function handleSessionStart(ctx, input) {
   const cwd = typeof ctx.CWD === 'string' ? ctx.CWD : '';
   const project = typeof ctx.Project === 'string' ? ctx.Project : '';
 
+  const legacyProject = typeof ctx.LegacyProject === 'string' ? ctx.LegacyProject : '';
+  const gitRemote = typeof ctx.GitRemote === 'string' ? ctx.GitRemote : '';
+  const relativePath = typeof ctx.RelativePath === 'string' ? ctx.RelativePath : '';
+
+  let injectURL = `/api/context/inject?project=${encodeURIComponent(project)}&cwd=${encodeURIComponent(cwd)}`;
+  if (legacyProject && legacyProject !== project) {
+    injectURL += `&legacy_project=${encodeURIComponent(legacyProject)}`;
+    injectURL += `&git_remote=${encodeURIComponent(gitRemote)}`;
+    injectURL += `&relative_path=${encodeURIComponent(relativePath)}`;
+  }
+
   let result = {};
   try {
-    result = await lib.requestGet(
-      `/api/context/inject?project=${encodeURIComponent(project)}&cwd=${encodeURIComponent(cwd)}`
-    );
+    result = await lib.requestGet(injectURL);
   } catch (error) {
     console.error(`[engram] Warning: context fetch failed: ${error.message}`);
     return '';
   }
 
-  const observations = Array.isArray(result.observations) ? result.observations : [];
+  const observations = Array.isArray(result.results)
+    ? result.results
+    : Array.isArray(result.observations)
+      ? result.observations
+      : [];
   let fullCount = 25;
   const fullCountCandidate = Number(result.full_count);
   if (Number.isFinite(fullCountCandidate) && fullCountCandidate > 0) {
@@ -70,10 +83,11 @@ async function handleSessionStart(ctx, input) {
     const obsType = escapeXmlTags(getString(observation.type));
     const title = escapeXmlTags(getString(observation.title));
     const typeLabel = obsType.toUpperCase();
+    const scopeTag = (typeof observation.scope === 'string' && observation.scope === 'global') ? ' [GLOBAL]' : '';
 
     if (i < fullCount) {
       const narrative = escapeXmlTags(getString(observation.narrative));
-      contextBuilder += `## ${i + 1}. [${typeLabel}] ${title}\n`;
+      contextBuilder += `## ${i + 1}. [${typeLabel}] ${title}${scopeTag}\n`;
       if (narrative !== '') {
         contextBuilder += `${narrative}\n`;
       }
@@ -82,9 +96,9 @@ async function handleSessionStart(ctx, input) {
     } else {
       const subtitle = escapeXmlTags(getString(observation.subtitle));
       if (subtitle !== '') {
-        contextBuilder += `- [${typeLabel}] ${title}: ${subtitle}\n`;
+        contextBuilder += `- [${typeLabel}] ${title}${scopeTag}: ${subtitle}\n`;
       } else {
-        contextBuilder += `- [${typeLabel}] ${title}\n`;
+        contextBuilder += `- [${typeLabel}] ${title}${scopeTag}\n`;
       }
     }
   }
