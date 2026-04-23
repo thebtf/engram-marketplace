@@ -67,12 +67,12 @@ function formatBehaviorRulesBlock(rules) {
 
   for (const rule of rules) {
     if (!rule || typeof rule !== 'object') continue;
-    const title = escapeXmlTags(getString(rule.title)).trim();
-    const narrative = escapeXmlTags(getString(rule.narrative) || getString(rule.content)).trim();
+    const title = escapeXmlTags(getString(rule.title) || getString(rule.content));
+    const narrative = escapeXmlTags(getString(rule.narrative) || getString(rule.content));
     if (title !== '') {
       block += `## ${title}\n`;
     }
-    if (narrative !== '' && narrative !== title) {
+    if (narrative !== '') {
       block += `${narrative}\n`;
     }
     block += formatFactsLine(rule.facts);
@@ -216,11 +216,7 @@ async function handleSessionStart(ctx, input) {
 
     if (issues.length > 0) {
       console.error(`[engram] Injecting ${issues.length} active issues for ${project}`);
-      const openIds = [...new Set(
-        issues
-          .filter((issue) => issue && issue.status === 'open' && Number.isFinite(Number(issue.id)) && Number(issue.id) > 0)
-          .map((issue) => Number(issue.id))
-      )];
+      const openIds = issues.filter((issue) => issue && issue.status === 'open').map((issue) => issue.id);
       if (openIds.length > 0) {
         lib.requestPost('/api/issues/acknowledge', { ids: openIds }, 3000).catch(() => {});
       }
