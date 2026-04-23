@@ -67,12 +67,12 @@ function formatBehaviorRulesBlock(rules) {
 
   for (const rule of rules) {
     if (!rule || typeof rule !== 'object') continue;
-    const title = escapeXmlTags(getString(rule.title) || getString(rule.content));
+    const title = escapeXmlTags(getString(rule.title));
     const narrative = escapeXmlTags(getString(rule.narrative) || getString(rule.content));
     if (title !== '') {
       block += `## ${title}\n`;
     }
-    if (narrative !== '') {
+    if (narrative !== '' && narrative !== title) {
       block += `${narrative}\n`;
     }
     block += formatFactsLine(rule.facts);
