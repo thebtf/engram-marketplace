@@ -30,6 +30,7 @@ test('returns empty for unsupported tool', async () => {
     lib.requestGet = originalRequestGet;
   }
 });
+
 test('Read with repeated signal returns trigger context', async () => {
   const sessionID = 'pre-tool-read-1';
   cleanupSignals(sessionID);
@@ -153,3 +154,4 @@ test('Edit skips Windows Temp paths case-insensitively', async () => {
     lib.requestPost = originalRequestPost;
   }
 });
+
