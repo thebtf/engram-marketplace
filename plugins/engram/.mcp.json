@@ -4,7 +4,7 @@
       "type": "stdio",
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/scripts/run-engram.js"
+        "./scripts/run-engram.js"
       ],
       "cwd": ".",
       "env_vars": [
