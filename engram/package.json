@@ -1,0 +1,13 @@
+{
+  "name": "engram",
+  "version": "6.47.7",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "omp": {
+    "extensions": [
+      "./extensions/engram-memory.mjs"
+    ]
+  }
+}
