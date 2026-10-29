@@ -6,7 +6,7 @@ const { execFile, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { hashFile, loadPolicy, objectRoots, resolveForLaunch } = require("./ensure-binary.js");
+const { DOWNLOAD_DEADLINE_MS, hashFile, loadPolicy, objectRoots, resolveForLaunch } = require("./ensure-binary.js");
 const { installationClientInstanceID } = require("./client-instance.js");
 
 const STARTUP_DIAGNOSTIC_LOG_MAX_BYTES = 128 * 1024;
@@ -94,12 +94,22 @@ async function resolveClient(options, projectOnly = false) {
  const resolved = await (options.resolve || resolveForLaunch)({
   pluginRoot: options.pluginRoot, pluginData: options.pluginData, policy,
   signal: options.signal, timeoutMs: options.timeoutMs, deadlineAt: options.deadlineAt,
+  acquire: options.acquire,
   ...(projectOnly ? { parserTarget: null } : {}),
  });
  if (!(options.hash || hashFile)(resolved.path, resolved.target, (options.roots || objectRoots)(options.pluginData).objects, options)) {
   throw new Error("resolved client failed final integrity verification");
  }
  return resolved;
+}
+
+async function prepareHookClient(options = {}) {
+ const now = Date.now();
+ const pluginRoot = options.pluginRoot || resolvePluginRoot();
+ const pluginData = options.pluginData || resolvePluginData(pluginRoot);
+ const deadlineAt = Math.min(options.deadlineAt ?? now + DOWNLOAD_DEADLINE_MS,
+  now + (options.timeoutMs ?? DOWNLOAD_DEADLINE_MS), now + DOWNLOAD_DEADLINE_MS);
+ await resolveClient({ ...options, pluginRoot, pluginData, deadlineAt }, true);
 }
 
 function resolveHostRoot(env = process.env, cwd = process.cwd()) {
@@ -123,11 +133,13 @@ async function resolveLogicalProject(root, options = {}) {
   }, (error, stdout) => {
    if (error) {
     let code = 'PROJECT_RESOLUTION_UNAVAILABLE';
+    let guidance = '';
     try {
      const result = JSON.parse(stdout);
      if (typeof result.code === 'string' && /^PROJECT_[A-Z_]+$/.test(result.code)) code = result.code;
+     if (typeof result.guidance === 'string' && result.guidance.length <= 3072) guidance = result.guidance;
     } catch { }
-    reject(new Error(code));
+    reject(Object.assign(new Error(guidance ? `${code}: ${guidance}` : code), { code, guidance }));
    } else resolve(stdout);
   });
  });
@@ -448,6 +460,7 @@ module.exports = {
  resolvePluginRoot,
  resolveAndSpawn,
  resolveLogicalProject,
+ prepareHookClient,
  resolveHostRoot,
  codexMcpConfig,
  spawnFailureMessage,

@@ -19,6 +19,8 @@ const {
   resolvePluginData,
   resolvePluginRoot,
   resolveAndSpawn,
+  prepareHookClient,
+  resolveLogicalProject,
   spawnFailureMessage,
   trimStartupDiagnosticLog,
 } = require("./run-engram.js");
@@ -692,6 +694,46 @@ test("verified parser identity reaches daemon without inherited parser overrides
   assert.equal(calls[1].options.env.ENGRAM_UCI_PARSER_EXECUTABLE, "parser");
 });
 
+test("hook preparation is client-only and verify-only project callbacks refuse missing or tampered CAS before exec", async () => {
+  const crypto = require("node:crypto");
+  const { createPolicy, TARGET_ASSETS } = require("./bootstrap-policy.js");
+  const { hashFile, objectPath, objectRoots, parsePolicy, resolveForLaunch } = require("./ensure-binary.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "engram-hook-readiness-"));
+  const bytes = Buffer.from("trusted hook readiness client");
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex"), version = "7.0.6";
+  const targets = Object.fromEntries(Object.entries(TARGET_ASSETS).map(([key, asset]) => [key, { version, asset, size: bytes.length, sha256 }]));
+  const policy = parsePolicy(JSON.stringify(createPolicy(version, targets)), version);
+  const roots = objectRoots(root), object = objectPath(roots, policy.target.desired);
+  let requests = 0, executions = 0;
+  const resolve = options => resolveForLaunch({ ...options, policy, request() { requests++; throw new Error("fixture forbids network"); } });
+  try {
+    fs.writeFileSync(object, bytes);
+    assert.equal(await prepareHookClient({ pluginRoot: root, pluginData: root, resolve }), undefined);
+    assert.equal(hashFile(object, policy.target.desired, roots.objects), true);
+    assert.equal(fs.existsSync(path.join(path.dirname(object), "parser")), false);
+    assert.equal(fs.existsSync(path.join(root, "client-instance-id")), false);
+    for (const mode of ["missing", "tampered"]) {
+      if (mode === "missing") fs.unlinkSync(object);
+      else { const tampered = Buffer.from(bytes); tampered[0] ^= 1; fs.writeFileSync(object, tampered); }
+      await assert.rejects(resolveLogicalProject(root, {
+        pluginRoot: root, pluginData: root, acquire: false, timeoutMs: 5000, resolve,
+        execFile() { executions++; throw new Error("untrusted client must not execute"); },
+      }), /HOOK_CLIENT_UNAVAILABLE/);
+    }
+    fs.writeFileSync(object, bytes);
+    await assert.rejects(prepareHookClient({
+      pluginRoot: root, pluginData: root, resolve: async options => {
+        const trusted = await resolve(options);
+        fs.writeFileSync(object, Buffer.alloc(bytes.length));
+        return trusted;
+      }
+    }), /final integrity verification/);
+    assert.equal(requests, 0);
+    assert.equal(executions, 0);
+    assert.deepEqual(fs.readdirSync(roots.staging), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 function restoreEnv(key, value) {
   if (value === undefined) {
     delete process.env[key];
@@ -705,3 +747,20 @@ function expandMcpArgsForTest(args, pluginRoot) {
   return args.map((arg) => arg.replaceAll("${CLAUDE_PLUGIN_ROOT}", pluginRoot.replaceAll("\\", "/")).replaceAll("${OMP_PLUGIN_ROOT}", pluginRoot.replaceAll("\\", "/")));
 }
 
+
+test("context recovery preserves native project code and fixed guidance through the installed launcher", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "engram-recovery-forward-"));
+  const guidance = "Use project resolve --root <actual-root> --json --check; preserve marker/cache";
+  try {
+    await assert.rejects(resolveLogicalProject(root, {
+      pluginRoot: path.resolve(__dirname, ".."), pluginData: root,
+      resolve: async () => ({ path: "trusted-fixture-client", target: {} }),
+      roots: () => ({ objects: root }), hash: () => true,
+      execFile(file, args, options, callback) {
+        assert.equal(file, "trusted-fixture-client");
+        assert.deepEqual(args, ["project", "resolve", "--root", root, "--json"]);
+        callback(new Error("native held operation"), JSON.stringify({ code: "PROJECT_MIGRATION_REQUIRED", guidance }));
+      },
+    }), error => error.code === "PROJECT_MIGRATION_REQUIRED" && error.guidance === guidance && error.message.includes(guidance));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
