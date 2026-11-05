@@ -1,6 +1,6 @@
 {
   "name": "engram",
-  "version": "7.0.19",
+  "version": "7.0.22",
   "private": true,
   "engines": {
     "node": ">=18"
