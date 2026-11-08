@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import cp from 'node:child_process';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import fs from 'node:fs';
 import { createRequire, register } from 'node:module';
 import os from 'node:os';
@@ -21,6 +23,8 @@ async function exerciseDefaultFactory(mode) {
   let cleanupRegisters = 0, cleanupUnregisters = 0, cleanupInvocations = 0, readiness = 'pending', factoryState = 'pending', preparationCalls = 0;
   let preparation, installing, preparedSignal, failure, held, afterPreparation, settled, afterTamper, afterRecovery, afterDisposal;
   const gate = deferred(), entered = deferred();
+  const policyLifetime = mode.startsWith('policy-');
+  const packageRoot = path.join(root, 'package');
   const terminalMode = mode.startsWith('terminal-noise');
   const onUnhandled = error => unhandled.push(String(error));
   process.on('unhandledRejection', onUnhandled);
@@ -37,11 +41,18 @@ async function exerciseDefaultFactory(mode) {
   const { BootstrapError, createPolicy } = require('../scripts/bootstrap-policy.js');
   const bytes = Buffer.from('controlled trusted startup client, never executable');
   const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-  const version = '7.0.7';
+  const version = policyLifetime ? require('../package.json').version : '7.0.7';
   const targets = Object.fromEntries(Object.entries(TARGET_ASSETS).map(([key, asset]) => [key, { version, asset, size: bytes.length, sha256 }]));
   const policy = parsePolicy(JSON.stringify(createPolicy(version, targets)), version);
+  if (policyLifetime) {
+    fs.mkdirSync(path.join(packageRoot, '.omp-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(packageRoot, '.omp-plugin', 'plugin.json'), JSON.stringify({ version }));
+    fs.writeFileSync(path.join(packageRoot, 'bootstrap-targets.json'), JSON.stringify(createPolicy(version, targets)));
+    process.env.PLUGIN_ROOT = packageRoot;
+  }
+  fs.writeFileSync(path.join(root, 'client-instance-id'), `engram-${'a'.repeat(32)}\n`);
   const roots = objectRoots(root), object = objectPath(roots, policy.target.desired);
-  if (mode === 'warm') fs.writeFileSync(object, bytes);
+  if (mode === 'warm' || policyLifetime) fs.writeFileSync(object, bytes);
   const project = '11111111-1111-4111-8111-111111111111';
   const verify = options => resolveForLaunch({
     ...options, pluginRoot: root, pluginData: root, policy, parserTarget: null, acquire: false,
@@ -56,22 +67,35 @@ async function exerciseDefaultFactory(mode) {
     assert.equal(preparation, undefined, 'one preparation per binding');
     assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 360000);
     preparedSignal = options.signal;
-    preparation = realPrepare({
-      ...options, pluginRoot: root, pluginData: root,
-      resolve: async forwarded => {
+    if (policyLifetime) {
+      preparation = (async () => {
         const abort = () => gate.resolve();
-        forwarded.signal.addEventListener('abort', abort, { once: true });
+        options.signal.addEventListener('abort', abort, { once: true });
         entered.resolve();
         try {
           await gate.promise;
-          if (terminalMode) throw new BootstrapError('controlled startup secret_fixture https://private.invalid/?token=token_fixture\n\x1b[31m');
-          if (mode === 'rejected') throw new Error('controlled offline readiness failure');
-          if (forwarded.signal.aborted) throw new Error('controlled readiness abort');
-          if (mode !== 'warm') fs.writeFileSync(object, mode === 'corrupt' ? Buffer.alloc(bytes.length) : bytes);
-          return await verify(forwarded);
-        } finally { forwarded.signal.removeEventListener('abort', abort); }
-      },
-    });
+          if (options.signal.aborted) throw new Error('controlled readiness abort');
+          return await realPrepare({ ...options, pluginRoot: packageRoot, pluginData: root });
+        } finally { options.signal.removeEventListener('abort', abort); }
+      })();
+    } else {
+      preparation = realPrepare({
+        ...options, pluginRoot: root, pluginData: root,
+        resolve: async forwarded => {
+          const abort = () => gate.resolve();
+          forwarded.signal.addEventListener('abort', abort, { once: true });
+          entered.resolve();
+          try {
+            await gate.promise;
+            if (terminalMode) throw new BootstrapError('controlled startup secret_fixture https://private.invalid/?token=token_fixture\n\x1b[31m');
+            if (mode === 'rejected') throw new Error('controlled offline readiness failure');
+            if (forwarded.signal.aborted) throw new Error('controlled readiness abort');
+            if (mode !== 'warm') fs.writeFileSync(object, mode === 'corrupt' ? Buffer.alloc(bytes.length) : bytes);
+            return await verify(forwarded);
+          } finally { forwarded.signal.removeEventListener('abort', abort); }
+        },
+      });
+    }
     preparation.then(() => { readiness = 'trusted'; }, () => { readiness = 'failed'; });
     return preparation;
   };
@@ -80,16 +104,43 @@ async function exerciseDefaultFactory(mode) {
     assert.notEqual(readiness, 'pending', 'pending preparation must not resolve a project');
     assert.equal(options.acquire, false, 'short callbacks must remain verify-only');
     return realResolve(cwd, {
-      ...options, pluginRoot: root, pluginData: root, resolve: verify,
+      ...options, pluginRoot: policyLifetime ? packageRoot : root, pluginData: root, ...(policyLifetime ? {} : { resolve: verify }),
       execFile(file, args, execOptions, callback) {
         effects.projectExecutions++;
         assert.equal(file, object);
         assert.equal(hashFile(file, policy.target.desired, roots.objects), true, 'only verified bytes may reach execution');
-        assert.deepEqual(args, ['project', 'resolve', '--root', root, '--json']);
+        assert.deepEqual(args, ['project', 'resolve', '--root', root, '--json', ...(options.check === true ? ['--check'] : [])]);
         executions.push({ args, timeout: execOptions.timeout });
-        callback(null, JSON.stringify({ project_id: project }));
+        callback(null, JSON.stringify(options.check === true ? { status: 'resolved', binding: { id: project, match: 'portable_marker' } } : { project_id: project }));
       },
     }).then(context => { readiness = 'trusted'; return context; });
+  };
+  const realTaskContext = launcher.requestTaskContext;
+  launcher.requestTaskContext = (facts, options) => {
+    effects.projectResolutions++;
+    assert.notEqual(readiness, 'pending');
+    return realTaskContext(facts, {
+      ...options, pluginRoot: policyLifetime ? packageRoot : root, pluginData: root, ...(policyLifetime ? {} : { resolve: verify }),
+      createTaskContextWorker(_entry, execution) {
+        effects.projectExecutions++;
+        const work = execution.workerData;
+        assert.equal(work.path, object);
+        assert.equal(hashFile(work.path, policy.target.desired, roots.objects), true);
+        assert.equal(work.cwd, root);
+        assert.ok(work.deadlineAt > Date.now());
+        executions.push({ args: ['task-context', '--json'], timeout: work.deadlineAt - Date.now() });
+        const request = JSON.parse(work.input);
+        assert.equal(request.schema, 1);
+        assert.equal(request.max_bytes, 8000);
+        const content = 'Do not remove the recovery backup.';
+        const digest = crypto.createHash('sha256').update(content).digest('hex');
+        const response = { schema: 1, status: 'ok', reason_code: 'OK', project: { status: 'resolved', binding: { id: project, match: 'portable_marker' } }, knowledge: { memory_status: 'ok', note_status: 'empty', rule_status: 'empty', items: [{ kind: 'memory', id: 42, content, content_hash: digest, source_hash: digest, excerpt: false }] } };
+        const worker = new EventEmitter();
+        worker.stdout = new PassThrough(); worker.stderr = new PassThrough(); worker.postMessage = () => { };
+        queueMicrotask(() => { const bytes = Buffer.from(JSON.stringify(response) + '\n'); worker.emit('message', { type: 'closed', ok: true, bytes: Uint8Array.from(bytes).buffer }); worker.emit('exit', 0); });
+        return worker;
+      },
+    }).then(response => { if (response.project?.status === 'resolved') readiness = 'trusted'; return response; });
   };
   globalThis.fetch = async (url, options) => {
     url = new URL(url);
@@ -100,11 +151,9 @@ async function exerciseDefaultFactory(mode) {
     assert.equal(options.method, 'POST');
     const body = JSON.parse(options.body);
     assert.equal(body.project, project);
-    assert.ok(['/api/context/session-start', '/api/hooks/ambient-candidates'].includes(url.pathname));
+    assert.equal(url.pathname, '/api/context/session-start');
     requests.push({ route: url.pathname, body });
-    return new Response(JSON.stringify(url.pathname === '/api/context/session-start'
-      ? { memories: [{ content: 'trusted startup fixture memory' }] }
-      : { additional_context: 'trusted startup fixture ambient' }));
+    return new Response(JSON.stringify({ memories: [{ content: 'trusted startup fixture memory' }] }));
   };
   const singleton = Object.freeze({
     register(name, callback) {
@@ -149,7 +198,7 @@ async function exerciseDefaultFactory(mode) {
     }).then(() => { factoryState = 'fulfilled'; }, error => { factoryState = 'rejected'; return error; });
     await entered.promise;
     await turn();
-    assert.equal(fs.existsSync(object), mode === 'warm', 'only the warm fixture starts with cached client bytes');
+    assert.equal(fs.existsSync(object), mode === 'warm' || policyLifetime, 'only warm fixtures start with cached client bytes');
     assert.equal(await callbacks('while-held'), undefined);
     held = snapshot();
     assert.deepEqual(held.effects, { projectResolutions: 0, projectExecutions: 0, backendRequests: 0, nativeProcesses: 0, network: 0, downloads: 0 });
@@ -164,22 +213,43 @@ async function exerciseDefaultFactory(mode) {
     assert.equal(afterPreparation.sent, 0, 'preparation completion must not inject hidden context');
     const result = await callbacks('after-settlement');
     settled = snapshot();
-    if (mode === 'trusted' || mode === 'warm') {
+    if (mode === 'trusted' || mode === 'warm' || policyLifetime) {
       assert.equal(settled.readiness, 'trusted');
       assert.equal(settled.effects.projectResolutions, 2);
       assert.equal(settled.effects.projectExecutions, 2);
-      assert.equal(settled.effects.backendRequests, 2);
+      assert.equal(settled.effects.backendRequests, 1);
       assert.equal(sent.length, 1);
       assert.match(sent[0].message.content, /trusted startup fixture memory/);
       assert.deepEqual(sent[0].options, { deliverAs: 'nextTurn' });
-      assert.equal(result.message.content, 'trusted startup fixture ambient');
+      assert.match(result.message.content, /Do not remove the recovery backup\./);
       assert.deepEqual(executions.map((item, index) => item.timeout > 0 && item.timeout <= (index === 0 ? 5000 : 500)), [true, true]);
+      if (mode === 'policy-retired') {
+        fs.rmSync(packageRoot, { recursive: true });
+        assert.equal(fs.existsSync(packageRoot), false);
+        const retired = await callbacks('after-package-retirement');
+        assert.equal(sent.length, 2, 'session-start must deliver after package retirement');
+        assert.match(sent[1].message.content, /trusted startup fixture memory/);
+        assert.match(retired?.message.content ?? '', /Do not remove the recovery backup\./);
+        assert.equal(effects.projectExecutions, 4);
+        assert.equal(effects.backendRequests, 2);
+      } else if (policyLifetime) {
+        if (mode === 'policy-invalid') fs.writeFileSync(path.join(packageRoot, 'bootstrap-targets.json'), 'not json');
+        if (mode === 'policy-version') fs.writeFileSync(path.join(packageRoot, '.omp-plugin', 'plugin.json'), JSON.stringify({ version: '0.0.1' }));
+        if (mode === 'policy-changed-target') {
+          const replacement = Object.fromEntries(Object.entries(TARGET_ASSETS).map(([key, asset]) => [key, { version, asset, size: bytes.length, sha256: '0'.repeat(64) }]));
+          fs.writeFileSync(path.join(packageRoot, 'bootstrap-targets.json'), JSON.stringify(createPolicy(version, replacement)));
+        }
+        assert.equal(await callbacks('after-policy-change'), undefined, 'changed or invalid policy must deny prompt delivery');
+        assert.equal(sent.length, 1, 'changed or invalid policy must deny session delivery');
+        assert.equal(effects.projectExecutions, 2, 'no client may execute under changed or invalid policy');
+        assert.equal(effects.backendRequests, 1);
+      }
       fs.writeFileSync(object, Buffer.alloc(bytes.length));
       assert.equal(await callbacks('after-tamper'), undefined);
       afterTamper = snapshot();
-      assert.equal(afterTamper.effects.projectExecutions, 2, 'tampered bytes must not execute');
-      assert.equal(afterTamper.effects.backendRequests, 2, 'tampering must not request more context');
-      assert.equal(afterTamper.sent, 1, 'tampering must not replay enrichment');
+      assert.equal(afterTamper.effects.projectExecutions, mode === 'policy-retired' ? 4 : 2, 'tampered bytes must not execute');
+      assert.equal(afterTamper.effects.backendRequests, mode === 'policy-retired' ? 2 : 1, 'tampering must not request more context');
+      assert.equal(afterTamper.sent, mode === 'policy-retired' ? 2 : 1, 'tampering must not replay enrichment');
     } else {
       assert.equal(settled.readiness, 'failed');
       assert.deepEqual(settled.effects, { ...held.effects, projectResolutions: mode === 'cancelled' ? 0 : 2 },
@@ -195,11 +265,11 @@ async function exerciseDefaultFactory(mode) {
         const recovered = await callbacks('after-verified-cache');
         afterRecovery = snapshot();
         assert.equal(afterRecovery.readiness, 'trusted', 'only successful real trusted resolution may admit enrichment');
-        assert.deepEqual(afterRecovery.effects, { ...held.effects, projectResolutions: 4, projectExecutions: 2, backendRequests: 2 });
+        assert.deepEqual(afterRecovery.effects, { ...held.effects, projectResolutions: 4, projectExecutions: 2, backendRequests: 1 });
         assert.equal(sent.length, 1);
         assert.match(sent[0].message.content, /trusted startup fixture memory/);
         assert.deepEqual(sent[0].options, { deliverAs: 'nextTurn' });
-        assert.equal(recovered.message.content, 'trusted startup fixture ambient');
+        assert.match(recovered.message.content, /Do not remove the recovery backup\./);
         assert.deepEqual(executions.map((item, index) => item.timeout > 0 && item.timeout <= (index === 0 ? 5000 : 500)), [true, true]);
       }
     }
@@ -247,211 +317,109 @@ async function exerciseDefaultFactory(mode) {
   if (failure) throw failure;
 }
 
-async function exercisePackageLifetime(mode) {
+async function exercisePackageVersionBinding() {
   const require = createRequire(import.meta.url);
-  const fixture = process.env.ENGRAM_STARTUP_FIXTURE_ROOT;
-  const packageRoot = path.join(fixture, 'old-package');
-  const pluginData = path.join(fixture, 'shared-data');
+  const root = process.env.ENGRAM_STARTUP_FIXTURE_ROOT;
   const sourceRoot = fileURLToPath(new URL('../', import.meta.url));
-  const files = ['package.json', '.omp-plugin/plugin.json', 'extensions/engram-memory.mjs',
-    'hooks/lib.js', 'hooks/session-start.js', 'hooks/user-prompt.js',
-    'scripts/run-engram.js', 'scripts/ensure-binary.js', 'scripts/bootstrap-policy.js', 'scripts/client-instance.js'];
-  for (const name of files) {
-    const destination = path.join(packageRoot, name);
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.copyFileSync(path.join(sourceRoot, name), destination);
+  const { createPolicy, TARGET_ASSETS } = require('../scripts/bootstrap-policy.js');
+  const { loadPolicy, objectPath, objectRoots, hashFile } = require('../scripts/ensure-binary.js');
+  const sourcePolicy = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'bootstrap-targets.json'), 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, '.omp-plugin', 'plugin.json'), 'utf8'));
+  assert.equal(manifest.version, sourcePolicy.package_version, 'ordinary MCP metadata must match policy');
+  fs.mkdirSync(path.join(root, '.omp-plugin'));
+  fs.writeFileSync(path.join(root, '.omp-plugin', 'plugin.json'), JSON.stringify(manifest));
+  let policyText, bytes;
+  if (process.env.ENGRAM_STARTUP_RAW) {
+    policyText = JSON.stringify(sourcePolicy);
+    bytes = fs.readFileSync(process.env.ENGRAM_STARTUP_RAW);
+  } else {
+    bytes = Buffer.from('verified non-executable hook fixture');
+    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    const targets = Object.fromEntries(Object.entries(TARGET_ASSETS).map(([key, asset]) => [key, { version: manifest.version, asset, size: bytes.length, sha256 }]));
+    policyText = JSON.stringify(createPolicy(manifest.version, targets));
   }
-  fs.mkdirSync(pluginData, { recursive: true });
-  process.env.PLUGIN_DATA = pluginData;
-  const fixtureRequire = createRequire(path.join(packageRoot, 'package.json'));
-  const { createPolicy, TARGET_ASSETS } = fixtureRequire('./scripts/bootstrap-policy.js');
-  const { objectRoots, objectPath, hashFile, parsePolicy } = fixtureRequire('./scripts/ensure-binary.js');
-  const bytes = Buffer.from('controlled trusted startup client, never executable');
-  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-  const version = fixtureRequire('./package.json').version;
-  const targets = Object.fromEntries(Object.entries(TARGET_ASSETS).map(([key, asset]) => [key, { version, asset, size: bytes.length, sha256 }]));
-  const rawPolicy = createPolicy(version, targets);
-  const policyPath = path.join(packageRoot, 'bootstrap-targets.json');
-  fs.writeFileSync(policyPath, JSON.stringify(rawPolicy));
-  const policy = parsePolicy(JSON.stringify(rawPolicy), version);
-  const roots = objectRoots(pluginData), object = objectPath(roots, policy.target.desired);
+  fs.writeFileSync(path.join(root, 'bootstrap-targets.json'), policyText);
+  const policy = loadPolicy(root);
+  const roots = objectRoots(root), object = objectPath(roots, policy.target.desired);
   fs.writeFileSync(object, bytes);
-  const entryPath = path.join(packageRoot, 'extensions/engram-memory.mjs');
-  const entrySHA256 = crypto.createHash('sha256').update(fs.readFileSync(entryPath)).digest('hex');
-  const launcherSHA256 = crypto.createHash('sha256').update(fs.readFileSync(path.join(packageRoot, 'scripts/run-engram.js'))).digest('hex');
-  const effects = { executions: 0, requests: 0, network: 0, unexpectedProcesses: 0 };
-  const project = '11111111-1111-4111-8111-111111111111';
-  for (const name of ['exec', 'execSync', 'execFileSync', 'spawn', 'spawnSync', 'fork']) {
-    cp[name] = () => { effects.unexpectedProcesses++; throw new Error('unexpected native process'); };
-  }
-  cp.execFile = (file, args, options, callback) => {
-    assert.equal(file, object);
-    assert.equal(hashFile(file, policy.target.desired, roots.objects), true);
-    assert.deepEqual(args, ['project', 'resolve', '--root', fixture, '--json']);
-    effects.executions++;
-    callback(null, JSON.stringify({ project_id: project }));
-  };
+  assert.equal(hashFile(object, policy.target.desired, roots.objects), true, 'fixture must be a verified cache object');
   for (const [module, names] of [['node:http', ['request', 'get']], ['node:https', ['request', 'get']], ['node:net', ['connect', 'createConnection']], ['node:tls', ['connect']]]) {
-    for (const name of names) require(module)[name] = () => { effects.network++; throw new Error('unexpected network'); };
+    for (const name of names) require(module)[name] = () => { throw new Error('unexpected network'); };
   }
-  globalThis.fetch = async (url, options) => {
-    assert.equal(hashFile(object, policy.target.desired, roots.objects), true);
-    assert.equal(JSON.parse(options.body).project, project);
-    effects.requests++;
-    return new Response(JSON.stringify(new URL(url).pathname === '/api/context/session-start'
-      ? { memories: [{ content: 'trusted startup fixture memory' }] }
-      : { additional_context: 'trusted startup fixture ambient' }));
-  };
-  const lib = fixtureRequire('./hooks/lib.js');
-  const launcher = fixtureRequire('./scripts/run-engram.js');
-  const realPrepare = launcher.prepareHookClient;
-  const prepareEntered = deferred();
+  const launcher = require('../scripts/run-engram.js');
+  const prepare = launcher.prepareHookClient;
   let preparation;
+  const entered = deferred();
   launcher.prepareHookClient = options => {
-    preparation = realPrepare(options);
-    prepareEntered.resolve();
+    preparation = prepare(options);
+    entered.resolve();
     return preparation;
   };
-  const realResolve = lib.resolveHookProjectContext;
-  let verifyOnlyCalls = 0;
-  lib.resolveHookProjectContext = (cwd, options) => {
-    assert.equal(options.acquire, false, 'foreground project resolution must never acquire');
-    verifyOnlyCalls++;
-    return realResolve(cwd, options);
-  };
-  const realConfig = lib.resolveEngramRuntimeConfig;
-  const gate = deferred(), entered = deferred();
-  let configCalls = 0;
-  lib.resolveEngramRuntimeConfig = async options => {
-    if (++configCalls === 1) { entered.resolve(); await gate.promise; }
-    return realConfig(options);
-  };
-  const handlers = new Map(), sent = [], registrations = new Map();
-  const singleton = { register(name, callback) { registrations.set(name, callback); return () => registrations.delete(name); } };
-  const key = 'engram.startup.fixture.lifetime';
-  globalThis[Symbol.for(key)] = singleton;
+  const key = 'engram.version.fixture.postmortem';
+  globalThis[Symbol.for(key)] = { register() { return () => { }; } };
   const hostURL = `data:text/javascript,${encodeURIComponent(`export const postmortem = globalThis[Symbol.for(${JSON.stringify(key)})];`)}`;
-  register(`data:text/javascript,${encodeURIComponent(`export function resolve(specifier, context, nextResolve) {
-    if (specifier === '@oh-my-pi/pi-utils') return { url: ${JSON.stringify(hostURL)}, shortCircuit: true };
-    if (specifier.startsWith('@oh-my-pi/pi-utils/')) throw new Error('unregistered host subpath');
-    return nextResolve(specifier, context);
-  }`)}`);
-  try {
-    const actual = await import(new URL(`file:///${entryPath.replaceAll('\\', '/')}`).href);
-    await actual.default({ on(name, callback) { handlers.set(name, callback); }, sendMessage(message) { sent.push(message); } });
-    await entered.promise;
-    assert.deepEqual([...handlers.keys()], ['session_start', 'before_agent_start']);
-    assert.equal(hashFile(object, policy.target.desired, roots.objects), true);
-    if (mode === 'retired') fs.rmSync(packageRoot, { recursive: true });
-    gate.resolve();
-    await prepareEntered.promise;
-    const preparationResult = await preparation.then(() => 'ready', error => error.name);
-    await turn();
-    if (mode === 'corrupt') fs.writeFileSync(object, Buffer.alloc(bytes.length));
-    if (mode === 'revoked') {
-      rawPolicy.revoked_sha256.push(sha256);
-      fs.writeFileSync(policyPath, JSON.stringify(rawPolicy));
-    }
-    await handlers.get('session_start')({ cwd: fixture, sessionId: 'lifetime-session' }, {});
-    const ambient = await handlers.get('before_agent_start')({ cwd: fixture, sessionId: 'lifetime-session', prompt: 'fixture prompt' }, {});
-    for (let i = 0; i < 4; i++) await turn();
-    const logPath = path.join(pluginData, 'logs', 'startup-env.log');
-    const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
-    console.log(`LIFETIME_RESULT ${JSON.stringify({
-      mode, entrySHA256, launcherSHA256, clientSHA256: sha256,
-      packageRetired: !fs.existsSync(packageRoot), trustedCAS: hashFile(object, policy.target.desired, roots.objects),
-      effects, sent: sent.map(message => message.content), ambient: ambient?.message?.content ?? null,
-      preparationResult, verifyOnlyCalls, bootstrapDiagnostic: log.includes('stage=prepare code=BOOTSTRAP_ERROR'), registrations: registrations.size
-    })}`);
-  } finally {
-    gate.resolve();
-    for (const cleanup of registrations.values()) await cleanup();
-    delete globalThis[Symbol.for(key)];
-  }
+  register(`data:text/javascript,${encodeURIComponent(`export function resolve(specifier, context, nextResolve) { if (specifier === '@oh-my-pi/pi-utils') return { url: ${JSON.stringify(hostURL)}, shortCircuit: true }; return nextResolve(specifier, context); }`)}`);
+  const handlers = new Map();
+  const actual = await import(entry.href);
+  await actual.default({ on(name, callback) { handlers.set(name, callback); }, sendMessage() { } });
+  await entered.promise;
+  await preparation;
+  assert.ok(handlers.has('session_start'));
+  console.log(`PACKAGE_BINDING_RESULT policy=${policy.package_version} cache=verified preparation=ok`);
 }
 
-if (process.argv[2] === '--lifetime-worker') {
-  try { await exercisePackageLifetime(process.argv[3]); }
+if (process.argv[2] === '--package-binding-worker') {
+  try { await exercisePackageVersionBinding(); }
   catch (error) { console.error(error.stack); process.exitCode = 1; }
-} else
-  if (process.argv[2] === '--startup-worker') {
-    try { await exerciseDefaultFactory(process.argv[3]); }
-    catch (error) { console.error(error.stack); process.exitCode = 1; }
-  } else {
-    test('loaded package lifetime retains trusted context after fixture retirement', t => {
-      const buildRoot = process.env.ENGRAM_STARTUP_TEST_OUTPUT_ROOT || os.tmpdir();
-      const root = fs.mkdtempSync(path.join(buildRoot, 'hook-lifetime-01a15ebb-'));
+} else if (process.argv[2] === '--startup-worker') {
+  try { await exerciseDefaultFactory(process.argv[3]); }
+  catch (error) { console.error(error.stack); process.exitCode = 1; }
+} else {
+  test('valid MCP metadata admits the default hook factory with a verified cache', t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'HOOK-VERSION-startup-'));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE', 'ENGRAM_STARTUP_RAW'].includes(key.toUpperCase())));
+    for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMP', 'TEMP']) env[key] = root;
+    Object.assign(env, { PLUGIN_ROOT: root, PLUGIN_DATA: root, ENGRAM_DATA_DIR: root, ENGRAM_STARTUP_FIXTURE_ROOT: root, ENGRAM_URL: 'http://startup-fixture.invalid', ENGRAM_CONFIG_FILE: path.join(root, 'absent-config.json') });
+    let result;
+    try { result = cp.spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--package-binding-worker'], { env, encoding: 'utf8', windowsHide: true, timeout: 10000 }); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+    t.diagnostic(result.stdout);
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /cache=verified preparation=ok/);
+  });
+  for (const mode of ['trusted', 'warm', 'rejected', 'corrupt', 'cancelled', 'terminal-noise', 'terminal-noise-unwritable', 'policy-retired', 'policy-invalid', 'policy-changed-target', 'policy-version']) {
+    test(mode.startsWith('terminal-noise') ? `OMP default factory emits no raw terminal output during failed readiness and recovery (${mode})` : `OMP default factory registers during held ${mode === 'warm' ? 'warm' : 'cold'} readiness and preserves ${mode} execution guards`, t => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'HOOK-TERMINAL-startup-'));
       const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE'].includes(key.toUpperCase())));
       for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMP', 'TEMP']) env[key] = root;
-      Object.assign(env, { ENGRAM_URL: 'http://startup-fixture.invalid', ENGRAM_CONFIG_FILE: path.join(root, 'absent-config.json') });
-      const results = {};
+      Object.assign(env, { ENGRAM_STARTUP_FIXTURE_ROOT: root, ENGRAM_URL: 'http://startup-fixture.invalid', ENGRAM_CONFIG_FILE: path.join(root, 'absent-config.json'), ENGRAM_DATA_DIR: root });
+      env.PLUGIN_DATA = root;
+      if (mode === 'terminal-noise-unwritable') {
+        env.PLUGIN_DATA = path.join(root, 'not-a-directory');
+        fs.writeFileSync(env.PLUGIN_DATA, 'controlled diagnostic write failure');
+      } else if (mode === 'terminal-noise') {
+        fs.mkdirSync(path.join(root, 'logs'));
+        fs.writeFileSync(path.join(root, 'logs', 'startup-env.log'), 'x\n'.repeat(128 * 1024));
+      }
+      let result;
       try {
-        for (const mode of ['intact', 'corrupt', 'revoked', 'retired']) {
-          const fixture = path.join(root, mode);
-          fs.mkdirSync(fixture);
-          const result = cp.spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--lifetime-worker', mode], {
-            cwd: fileURLToPath(new URL('../../../', import.meta.url)), env: { ...env, ENGRAM_STARTUP_FIXTURE_ROOT: fixture },
-            encoding: 'utf8', windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024,
-          });
-          assert.ifError(result.error);
-          assert.equal(result.status, 0, result.stderr || result.stdout);
-          assert.equal(result.stderr, '', 'no raw terminal output');
-          assert.match(result.stdout, /^LIFETIME_RESULT [^\n]+\n$/);
-          results[mode] = JSON.parse(result.stdout.slice('LIFETIME_RESULT '.length));
-          t.diagnostic(JSON.stringify(results[mode]));
-        }
-      } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        t.diagnostic(`fixtureRemoved=${!fs.existsSync(root)}`);
+        result = cp.spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--startup-worker', mode], {
+          cwd: fileURLToPath(new URL('../../../', import.meta.url)), env, encoding: 'utf8', windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024,
+        });
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+      if (mode.startsWith('policy-')) t.diagnostic('Injected worker and backend: does not prove worker-file lifetime or installed host behavior.');
+      t.diagnostic(JSON.stringify({ mode, nativeExit: result.status, signal: result.signal, error: result.error?.message ?? null, fixtureRemoved: !fs.existsSync(root) }));
+      t.diagnostic(result.stdout);
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      if (mode.startsWith('terminal-noise')) {
+        const lines = result.stdout.trimEnd().split('\n');
+        assert.equal(lines.length, 1, 'only the worker result protocol may appear on stdout');
+        assert.ok(lines[0].startsWith('STARTUP_CAUSAL_RESULT '));
+        t.diagnostic(`worker stderr: ${JSON.stringify(result.stderr)}`);
+        assert.equal(result.stderr, '', 'background readiness, recovery and disposal must not write raw terminal output');
       }
-      for (const mode of ['intact', 'retired']) {
-        assert.equal(results[mode].trustedCAS, true);
-        assert.deepEqual(results[mode].effects, { executions: 2, requests: 2, network: 0, unexpectedProcesses: 0 });
-        assert.match(results[mode].sent[0], /trusted startup fixture memory/, `${mode} must deliver useful same-instance context`);
-        assert.equal(results[mode].ambient, 'trusted startup fixture ambient');
-      }
-      for (const mode of ['corrupt', 'revoked']) {
-        assert.equal(results[mode].verifyOnlyCalls, 2);
-        assert.equal(results[mode].effects.executions, 0);
-        assert.equal(results[mode].effects.requests, 0);
-        assert.equal(results[mode].effects.unexpectedProcesses, 0);
-        assert.deepEqual(results[mode].sent, []);
-        assert.equal(results[mode].ambient, null);
-      }
-      assert.equal(results.retired.packageRetired, true);
-      assert.equal(results.intact.packageRetired, false);
     });
-    for (const mode of ['trusted', 'warm', 'rejected', 'corrupt', 'cancelled', 'terminal-noise', 'terminal-noise-unwritable']) {
-      test(mode.startsWith('terminal-noise') ? `OMP default factory emits no raw terminal output during failed readiness and recovery (${mode})` : `OMP default factory registers during held ${mode === 'warm' ? 'warm' : 'cold'} readiness and preserves ${mode} execution guards`, t => {
-        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'HOOK-TERMINAL-startup-'));
-        const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE'].includes(key.toUpperCase())));
-        for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMP', 'TEMP']) env[key] = root;
-        Object.assign(env, { ENGRAM_STARTUP_FIXTURE_ROOT: root, ENGRAM_URL: 'http://startup-fixture.invalid', ENGRAM_CONFIG_FILE: path.join(root, 'absent-config.json'), ENGRAM_DATA_DIR: root });
-        env.PLUGIN_DATA = root;
-        if (mode === 'terminal-noise-unwritable') {
-          env.PLUGIN_DATA = path.join(root, 'not-a-directory');
-          fs.writeFileSync(env.PLUGIN_DATA, 'controlled diagnostic write failure');
-        } else if (mode === 'terminal-noise') {
-          fs.mkdirSync(path.join(root, 'logs'));
-          fs.writeFileSync(path.join(root, 'logs', 'startup-env.log'), 'x\n'.repeat(128 * 1024));
-        }
-        let result;
-        try {
-          result = cp.spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--startup-worker', mode], {
-            cwd: fileURLToPath(new URL('../../../', import.meta.url)), env, encoding: 'utf8', windowsHide: true, timeout: 10000, maxBuffer: 1024 * 1024,
-          });
-        } finally { fs.rmSync(root, { recursive: true, force: true }); }
-        t.diagnostic(JSON.stringify({ mode, nativeExit: result.status, signal: result.signal, error: result.error?.message ?? null, fixtureRemoved: !fs.existsSync(root) }));
-        t.diagnostic(result.stdout);
-        assert.ifError(result.error);
-        assert.equal(result.status, 0, result.stderr || result.stdout);
-        if (mode.startsWith('terminal-noise')) {
-          const lines = result.stdout.trimEnd().split('\n');
-          assert.equal(lines.length, 1, 'only the worker result protocol may appear on stdout');
-          assert.ok(lines[0].startsWith('STARTUP_CAUSAL_RESULT '));
-          t.diagnostic(`worker stderr: ${JSON.stringify(result.stderr)}`);
-          assert.equal(result.stderr, '', 'background readiness, recovery and disposal must not write raw terminal output');
-        }
-      });
-    }
   }
+}
